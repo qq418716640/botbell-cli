@@ -89,9 +89,23 @@ api_post() {
 
 api_get() {
     local url="$1"
-    curl -s -X GET "$url" \
+    local response http_code
+
+    response=$(curl -s -w "\n%{http_code}" -X GET "$url" \
         -H "X-Bot-Token: ${TOKEN}" \
-        -H "User-Agent: botbell-cli/${VERSION}"
+        -H "User-Agent: botbell-cli/${VERSION}")
+
+    http_code=$(echo "$response" | tail -1)
+    local resp_body
+    resp_body=$(echo "$response" | sed '$d')
+
+    if [ "$http_code" -ge 400 ]; then
+        local err_msg
+        err_msg=$(echo "$resp_body" | jq -r '.message // "Unknown error"' 2>/dev/null || echo "$resp_body")
+        die "Poll failed (HTTP ${http_code}): ${err_msg}"
+    fi
+
+    echo "$resp_body"
 }
 
 # ── Parse args ───────────────────────────────────────────────────────
