@@ -1,0 +1,228 @@
+#!/usr/bin/env bash
+#
+# botbell — Send push notifications from the command line via BotBell
+#
+# Usage:
+#   botbell send "Hello world"
+#   botbell send "Build passed" --title "✅ CI" --format markdown
+#   botbell approve "Deploy to prod?" --timeout 300
+#
+# Environment:
+#   BOTBELL_TOKEN   Bot token (bt_...) — required unless --token is passed
+#   BOTBELL_API     API base URL (default: https://api.botbell.app/v1)
+
+set -euo pipefail
+
+VERSION="0.1.0"
+API_BASE="${BOTBELL_API:-https://api.botbell.app/v1}"
+TOKEN="${BOTBELL_TOKEN:-}"
+
+# ── Usage ────────────────────────────────────────────────────────────
+
+usage() {
+    cat <<'USAGE'
+botbell — Push notifications for AI agents and scripts
+
+Commands:
+  send <message>      Send a push notification
+  approve <message>   Send approval request and wait for reply
+  version             Show version
+
+Send options:
+  --title <text>      Message title
+  --url <url>         Attached URL
+  --image <url>       Image URL
+  --format <fmt>      "text" (default) or "markdown"
+  --token <token>     Bot token (default: $BOTBELL_TOKEN)
+
+Approve options (in addition to send options):
+  --timeout <secs>    Max wait seconds (default: 1800)
+  --poll <secs>       Poll interval seconds (default: 5)
+  --actions <json>    Custom actions JSON array
+
+Examples:
+  botbell send "Deploy succeeded ✅"
+  botbell send "Build report" --title "📊 CI" --format markdown
+  botbell approve "Deploy to prod?" --timeout 300
+  botbell approve "Release?" --actions '[{"key":"yes","label":"Yes"},{"key":"no","label":"No"}]'
+
+Environment:
+  BOTBELL_TOKEN       Bot token (bt_...)
+  BOTBELL_API         API base URL (default: https://api.botbell.app/v1)
+USAGE
+}
+
+# ── Helpers ──────────────────────────────────────────────────────────
+
+die() { echo "botbell: error: $*" >&2; exit 1; }
+
+check_deps() {
+    command -v curl >/dev/null 2>&1 || die "curl is required"
+    command -v jq >/dev/null 2>&1   || die "jq is required (install: brew install jq / apt install jq)"
+}
+
+require_token() {
+    [ -n "$TOKEN" ] || die "no token. Set BOTBELL_TOKEN or use --token"
+}
+
+api_post() {
+    local url="$1" body="$2"
+    local response http_code
+
+    response=$(curl -s -w "\n%{http_code}" -X POST "$url" \
+        -H "Content-Type: application/json" \
+        -H "User-Agent: botbell-cli/${VERSION}" \
+        -d "$body")
+
+    http_code=$(echo "$response" | tail -1)
+    local resp_body
+    resp_body=$(echo "$response" | sed '$d')
+
+    if [ "$http_code" -ge 400 ]; then
+        local err_msg
+        err_msg=$(echo "$resp_body" | jq -r '.message // "Unknown error"' 2>/dev/null || echo "$resp_body")
+        die "API error (HTTP ${http_code}): ${err_msg}"
+    fi
+
+    echo "$resp_body"
+}
+
+api_get() {
+    local url="$1"
+    curl -s -X GET "$url" \
+        -H "X-Bot-Token: ${TOKEN}" \
+        -H "User-Agent: botbell-cli/${VERSION}"
+}
+
+# ── Parse args ───────────────────────────────────────────────────────
+
+parse_args() {
+    TITLE=""
+    URL=""
+    IMAGE_URL=""
+    FORMAT=""
+    TIMEOUT=1800
+    POLL_INTERVAL=5
+    ACTIONS=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --title)    TITLE="$2";         shift 2 ;;
+            --url)      URL="$2";           shift 2 ;;
+            --image)    IMAGE_URL="$2";     shift 2 ;;
+            --format)   FORMAT="$2";        shift 2 ;;
+            --token)    TOKEN="$2";         shift 2 ;;
+            --timeout)  TIMEOUT="$2";       shift 2 ;;
+            --poll)     POLL_INTERVAL="$2"; shift 2 ;;
+            --actions)  ACTIONS="$2";       shift 2 ;;
+            --api)      API_BASE="$2";      shift 2 ;;
+            -*)         die "unknown option: $1" ;;
+            *)          die "unexpected argument: $1" ;;
+        esac
+    done
+}
+
+build_body() {
+    local body
+    body=$(jq -n --arg msg "$MESSAGE" '{message: $msg}')
+
+    [ -n "$TITLE" ]     && body=$(echo "$body" | jq --arg v "$TITLE" '. + {title: $v}')
+    [ -n "$URL" ]       && body=$(echo "$body" | jq --arg v "$URL" '. + {url: $v}')
+    [ -n "$IMAGE_URL" ] && body=$(echo "$body" | jq --arg v "$IMAGE_URL" '. + {image_url: $v}')
+    [ -n "$FORMAT" ]    && body=$(echo "$body" | jq --arg v "$FORMAT" '. + {format: $v}')
+
+    echo "$body"
+}
+
+# ── Commands ─────────────────────────────────────────────────────────
+
+cmd_send() {
+    [ $# -lt 1 ] && die "usage: botbell send <message> [options]"
+    MESSAGE="$1"; shift
+    parse_args "$@"
+    require_token
+
+    local body
+    body=$(build_body)
+    body=$(echo "$body" | jq '. + {reply_mode: "none"}')
+
+    local resp
+    resp=$(api_post "${API_BASE}/push/${TOKEN}" "$body")
+
+    local msg_id delivered
+    msg_id=$(echo "$resp" | jq -r '.data.message_id')
+    delivered=$(echo "$resp" | jq -r '.data.delivered')
+
+    echo "Sent: ${msg_id} (delivered: ${delivered})"
+}
+
+cmd_approve() {
+    [ $# -lt 1 ] && die "usage: botbell approve <message> [options]"
+    MESSAGE="$1"; shift
+    parse_args "$@"
+    require_token
+
+    local body
+    body=$(build_body)
+
+    [ -z "$TITLE" ] && body=$(echo "$body" | jq '. + {title: "🔔 Approval Required"}')
+
+    body=$(echo "$body" | jq '. + {reply_mode: "actions_only"}')
+
+    if [ -n "$ACTIONS" ]; then
+        body=$(echo "$body" | jq --argjson actions "$ACTIONS" '. + {actions: $actions}')
+    else
+        body=$(echo "$body" | jq '. + {actions: [{"key":"approve","label":"Approve"},{"key":"reject","label":"Reject"}]}')
+    fi
+
+    local resp
+    resp=$(api_post "${API_BASE}/push/${TOKEN}" "$body")
+
+    local msg_id
+    msg_id=$(echo "$resp" | jq -r '.data.message_id')
+    echo "Approval request sent (${msg_id}), waiting up to ${TIMEOUT}s..." >&2
+
+    local deadline
+    deadline=$(( $(date +%s) + TIMEOUT ))
+
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        sleep "$POLL_INTERVAL"
+
+        local poll_resp
+        poll_resp=$(api_get "${API_BASE}/messages/poll")
+
+        local match
+        match=$(echo "$poll_resp" | jq -r --arg mid "$msg_id" \
+            '.data.messages[]? | select(.reply_to == $mid) | @json' 2>/dev/null | head -1)
+
+        if [ -n "$match" ]; then
+            local action content
+            action=$(echo "$match" | jq -r '.action // ""')
+            content=$(echo "$match" | jq -r '.content // ""')
+
+            if [ "$action" = "approve" ]; then
+                echo "Approved!"
+                exit 0
+            else
+                local reason="${content:-$action}"
+                die "Rejected — ${reason}"
+            fi
+        fi
+    done
+
+    die "Approval timed out after ${TIMEOUT}s"
+}
+
+# ── Main ─────────────────────────────────────────────────────────────
+
+[ $# -lt 1 ] && { usage; exit 1; }
+
+check_deps
+
+case "$1" in
+    send)     shift; cmd_send "$@" ;;
+    approve)  shift; cmd_approve "$@" ;;
+    version)  echo "botbell ${VERSION}" ;;
+    help|-h|--help) usage ;;
+    *)        die "unknown command: $1. Run 'botbell help' for usage." ;;
+esac
