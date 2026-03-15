@@ -1,3 +1,5 @@
+[English](README.md) | [中文](README.zh-CN.md)
+
 # botbell-cli
 
 Send push notifications from the command line via [BotBell](https://botbell.app).
